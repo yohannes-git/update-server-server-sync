@@ -46,8 +46,24 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Source
                     throw new Exception("Missing XmlUpdateBlobCompressed");
                 }
 
-                // This call will throw an exception if a decompressor is not available for the current platform.
-                metadata = CabinetUtility.RecompressUnicodeData(serverSyncData.XmlUpdateBlobCompressed);
+                // This call will throw an exception if a decompressor is not available for the current platform,
+                // or if the platform decompressor (expand.exe / cabextract) fails on this update's cabinet data.
+                try
+                {
+                    metadata = CabinetUtility.RecompressUnicodeData(serverSyncData.XmlUpdateBlobCompressed);
+                }
+                catch (Exception ex)
+                {
+                    throw new InvalidOperationException(
+                        $"Failed to decompress metadata for update {serverSyncData.Id?.UpdateID} revision {serverSyncData.Id?.RevisionNumber}: {ex.Message}",
+                        ex);
+                }
+
+                if (metadata == null || metadata.Length == 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Decompression produced no data for update {serverSyncData.Id?.UpdateID} revision {serverSyncData.Id?.RevisionNumber}.");
+                }
             }
 
             if (sourceFilter?.StripUnrequestedLocalizedProperties == true && sourceFilter.LanguagesFilter?.Count > 0)

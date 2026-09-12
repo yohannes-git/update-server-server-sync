@@ -45,7 +45,6 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Compression
             var cabTempFile = Path.GetTempFileName();
             var xmlTempFile = Path.GetTempFileName();
 
-            var inMemoryStream = new MemoryStream();
             try
             {
                 File.WriteAllBytes(cabTempFile, compressedData);
@@ -53,37 +52,45 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Compression
                 var startInfo = new ProcessStartInfo("expand.exe", $"\"{cabTempFile}\" \"{xmlTempFile}\"")
                 {
                     UseShellExecute = false,
-                    CreateNoWindow = true
+                    CreateNoWindow = true,
+                    RedirectStandardError = true
                 };
-                var expandProcess = Process.Start(startInfo);
-                expandProcess.WaitForExit();
 
-                using var decompresedFile = File.OpenRead(xmlTempFile);
-                using var recompressor = new GZipStream(inMemoryStream, CompressionLevel.Fastest, true);
-                decompresedFile.CopyTo(recompressor);
-            }
-            catch (Exception)
-            {
-                inMemoryStream = null;
-            }
+                string stderr;
+                int exitCode;
+                using (var expandProcess = Process.Start(startInfo))
+                {
+                    stderr = expandProcess.StandardError.ReadToEnd();
+                    expandProcess.WaitForExit();
+                    exitCode = expandProcess.ExitCode;
+                }
 
-            if (File.Exists(cabTempFile))
-            {
-                File.Delete(cabTempFile);
-            }
+                if (exitCode != 0)
+                {
+                    throw new InvalidDataException(
+                        $"expand.exe failed to decompress cabinet data (exit code {exitCode}): {stderr.Trim()}");
+                }
 
-            if (File.Exists(xmlTempFile))
-            {
-                File.Delete(xmlTempFile);
-            }
+                using var inMemoryStream = new MemoryStream();
+                using (var decompresedFile = File.OpenRead(xmlTempFile))
+                using (var recompressor = new GZipStream(inMemoryStream, CompressionLevel.Fastest, true))
+                {
+                    decompresedFile.CopyTo(recompressor);
+                }
 
-            if (inMemoryStream != null)
-            {
                 return inMemoryStream.ToArray();
             }
-            else
+            finally
             {
-                return null;
+                if (File.Exists(cabTempFile))
+                {
+                    File.Delete(cabTempFile);
+                }
+
+                if (File.Exists(xmlTempFile))
+                {
+                    File.Delete(xmlTempFile);
+                }
             }
         }
 
@@ -93,8 +100,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Compression
             // Then run cabextract on it with --pipe output
             var cabTempFile = Path.GetTempFileName();
             var xmlTempFile = Path.GetTempFileName();
-            
-            var inMemoryStream = new MemoryStream();
+
             try
             {
                 File.WriteAllBytes(cabTempFile, compressedData);
@@ -106,49 +112,52 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Compression
                     UseShellExecute = false,
                     // The decompressed text is Unicode
                     StandardOutputEncoding = Encoding.Unicode,
-                    RedirectStandardOutput = true
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
                 };
-                var expandProcess = Process.Start(startInfo);
 
-                // Read the decompressed data from the pipe
-                if (expandProcess != null)
+                string stderr;
+                int exitCode;
+                using (var expandProcess = Process.Start(startInfo))
                 {
+                    // Read the decompressed data from the pipe
                     using (StreamWriter writer = new StreamWriter(xmlTempFile))
                     {
                         expandProcess.StandardOutput.BaseStream.CopyTo(writer.BaseStream);
                     }
 
+                    stderr = expandProcess.StandardError.ReadToEnd();
                     expandProcess.WaitForExit();
+                    exitCode = expandProcess.ExitCode;
+                }
+
+                if (exitCode != 0)
+                {
+                    throw new InvalidDataException(
+                        $"cabextract failed to decompress cabinet data (exit code {exitCode}): {stderr.Trim()}");
                 }
 
                 // Recompress the XML with GZIP as UTF8
-                using var decompressor = File.OpenRead(xmlTempFile);
-                using var recompressor = new GZipStream(inMemoryStream, CompressionLevel.Fastest, true);
-                decompressor.CopyTo(recompressor);
+                using var inMemoryStream = new MemoryStream();
+                using (var decompressor = File.OpenRead(xmlTempFile))
+                using (var recompressor = new GZipStream(inMemoryStream, CompressionLevel.Fastest, true))
+                {
+                    decompressor.CopyTo(recompressor);
+                }
 
-            }
-            catch (Exception)
-            {
-                inMemoryStream = null;
-            }
-
-            if (File.Exists(cabTempFile))
-            {
-                File.Delete(cabTempFile);
-            }
-
-            if (File.Exists(xmlTempFile))
-            {
-                File.Delete(xmlTempFile);
-            }
-
-            if (inMemoryStream != null)
-            {
                 return inMemoryStream.ToArray();
             }
-            else
+            finally
             {
-                return null;
+                if (File.Exists(cabTempFile))
+                {
+                    File.Delete(cabTempFile);
+                }
+
+                if (File.Exists(xmlTempFile))
+                {
+                    File.Delete(xmlTempFile);
+                }
             }
         }
 
