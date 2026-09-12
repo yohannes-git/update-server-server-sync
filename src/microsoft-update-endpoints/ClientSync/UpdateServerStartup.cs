@@ -33,6 +33,8 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
 
         readonly string ContentRoot;
 
+        ClientSyncWebService ClientSyncService;
+
 
         /// <summary>
         /// Creates the update server startup using the specified configuration an update metadata store
@@ -83,13 +85,13 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
             services.AddSoapCore();
 
             // Enable the upstream WCF services
-            var clientSyncService = new ClientSyncWebService();
-            clientSyncService.SetContentURLBase(ContentSource == null ? null : ContentRoot);
-            clientSyncService.SetServiceConfiguration(UpdateServiceConfiguration);
-            clientSyncService.SetPackageStore(MetadataSource);
+            ClientSyncService = new ClientSyncWebService();
+            ClientSyncService.SetContentURLBase(ContentSource == null ? null : ContentRoot);
+            ClientSyncService.SetServiceConfiguration(UpdateServiceConfiguration);
+            ClientSyncService.SetPackageStore(MetadataSource);
 
             services.AddSingleton<IClientSyncMetadataStore>(MetadataSource);
-            services.TryAddSingleton<ClientSyncWebService>(clientSyncService);
+            services.TryAddSingleton<ClientSyncWebService>(ClientSyncService);
             services.TryAddSingleton<SimpleAuthenticationWebService>();
             services.TryAddSingleton<ReportingWebService>();
 
@@ -110,6 +112,8 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         /// <param name="loggerFactory">Logging factory</param>
         public void Configure(IApplicationBuilder app, IHostingEnvironment env, ILoggerFactory loggerFactory)
         {
+            ClientSyncService.SetLogger(loggerFactory.CreateLogger<ClientSyncWebService>());
+
             if (env.IsDevelopment())
             {
                 app.UseDeveloperExceptionPage();

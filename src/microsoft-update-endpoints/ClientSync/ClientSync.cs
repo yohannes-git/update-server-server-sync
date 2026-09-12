@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata;
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Content;
 using Microsoft.PackageGraph.ObjectModel;
@@ -33,6 +35,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
         private const int MaxUpdatesInResponse = 50;
         private static long ScanSequence;
         private string ContentRoot;
+        private ILogger _logger = NullLogger.Instance;
 
         /// <summary>
         /// Default constructor.
@@ -143,6 +146,14 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
             UpdateServiceConfigurationLastChange();
         }
 
+        /// <summary>
+        /// Sets the logger used to report client-sync diagnostics. Defaults to a no-op logger.
+        /// </summary>
+        public void SetLogger(ILogger logger)
+        {
+            _logger = logger ?? NullLogger.Instance;
+        }
+
         private void UpdateServiceConfigurationLastChange()
         {
             if (ServiceConfiguration == null || MetadataSource == null)
@@ -216,8 +227,9 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
                     updateID.RevisionNumber);
                 if (!MetadataSource.TryGetPackage(identity, out var package))
                 {
-                    System.Diagnostics.Trace.TraceWarning(
-                        $"Ignoring a stale client update identity that is not present in the published catalog: {identity}");
+                    _logger.LogWarning(
+                        "Ignoring a stale client update identity that is not present in the published catalog: {Identity}",
+                        identity);
                     continue;
                 }
 
@@ -314,8 +326,9 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
             {
                 if (!MetadataSource.TryGetPackage(requestedRevision, out var package))
                 {
-                    System.Diagnostics.Trace.TraceWarning(
-                        $"Ignoring stale client revision ID {requestedRevision}; it is not present in the published catalog.");
+                    _logger.LogWarning(
+                        "Ignoring stale client revision ID {RevisionId}; it is not present in the published catalog.",
+                        requestedRevision);
                     continue;
                 }
 
@@ -434,10 +447,14 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
             var scanId = Interlocked.Increment(ref ScanSequence);
             var scanType = parameters.SkipSoftwareSync ? "drivers" : "software";
             var totalStopwatch = Stopwatch.StartNew();
-            Trace.TraceInformation(
-                $"Client scan {scanId} started: type={scanType}, " +
-                $"devices={parameters.SystemSpec?.Length ?? 0}, installed_non_leaf={parameters.InstalledNonLeafUpdateIDs?.Length ?? 0}, " +
-                $"other_cached={parameters.OtherCachedUpdateIDs?.Length ?? 0}, cached_drivers={parameters.CachedDriverIDs?.Length ?? 0}.");
+            _logger.LogInformation(
+                "Client scan {ScanId} started: type={ScanType}, devices={DeviceCount}, installed_non_leaf={InstalledNonLeafCount}, other_cached={OtherCachedCount}, cached_drivers={CachedDriverCount}.",
+                scanId,
+                scanType,
+                parameters.SystemSpec?.Length ?? 0,
+                parameters.InstalledNonLeafUpdateIDs?.Length ?? 0,
+                parameters.OtherCachedUpdateIDs?.Length ?? 0,
+                parameters.CachedDriverIDs?.Length ?? 0);
 
             try
             {
@@ -447,8 +464,10 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
                 }
                 catch (Exception exception)
                 {
-                    Trace.TraceError(
-                        $"Client scan {scanId}: cannot record observed client inventory: {exception}");
+                    _logger.LogError(
+                        exception,
+                        "Client scan {ScanId}: cannot record observed client inventory.",
+                        scanId);
                 }
 
                 return parameters.SkipSoftwareSync
@@ -457,16 +476,21 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
             }
             catch (Exception exception)
             {
-                Trace.TraceError(
-                    $"Client scan {scanId} failed after {totalStopwatch.ElapsedMilliseconds} ms: {exception}");
+                _logger.LogError(
+                    exception,
+                    "Client scan {ScanId} failed after {ElapsedMilliseconds} ms.",
+                    scanId,
+                    totalStopwatch.ElapsedMilliseconds);
                 throw;
             }
             finally
             {
                 totalStopwatch.Stop();
-                Trace.TraceInformation(
-                    $"Client scan {scanId} completed: type={scanType}, " +
-                    $"total_ms={totalStopwatch.ElapsedMilliseconds}.");
+                _logger.LogInformation(
+                    "Client scan {ScanId} completed: type={ScanType}, total_ms={ElapsedMilliseconds}.",
+                    scanId,
+                    scanType,
+                    totalStopwatch.ElapsedMilliseconds);
             }
         }
 
@@ -497,10 +521,11 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
             if (missingRevisionIds.Count > 0)
             {
                 var sample = string.Join(", ", missingRevisionIds.Take(20));
-                System.Diagnostics.Trace.TraceWarning(
-                    $"Ignored {missingRevisionIds.Count} stale client revision ID(s) that are not present " +
-                    $"in the published catalog: {sample}" +
-                    (missingRevisionIds.Count > 20 ? ", ..." : string.Empty));
+                _logger.LogWarning(
+                    "Ignored {MissingCount} stale client revision ID(s) that are not present in the published catalog: {Sample}{Ellipsis}",
+                    missingRevisionIds.Count,
+                    sample,
+                    missingRevisionIds.Count > 20 ? ", ..." : string.Empty);
             }
 
             return identities;

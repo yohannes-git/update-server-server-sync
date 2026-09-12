@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+using Microsoft.Extensions.Logging;
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata;
 using Microsoft.PackageGraph.Storage;
 using Microsoft.UpdateServices.WebServices.ClientSync;
@@ -100,8 +101,9 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
 
                 if (records.Count == 0)
                 {
-                    System.Diagnostics.Trace.TraceInformation(
-                        $"Client software stage {stage}: no candidate returned.");
+                    _logger.LogInformation(
+                        "Client software stage {Stage}: no candidate returned.",
+                        stage);
                     return false;
                 }
 
@@ -124,8 +126,9 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
 
                 if (packages.Count == 0)
                 {
-                    System.Diagnostics.Trace.TraceInformation(
-                        $"Client software stage {stage}: no candidate returned.");
+                    _logger.LogInformation(
+                        "Client software stage {Stage}: no candidate returned.",
+                        stage);
                     return false;
                 }
 
@@ -141,9 +144,12 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
                 ? truncated
                 : true;
 
-            System.Diagnostics.Trace.TraceInformation(
-                $"Client software stage {stage}: offered={response.NewUpdates?.Length ?? 0}, " +
-                $"sql_truncated={truncated}, response_truncated={response.Truncated}.");
+            _logger.LogInformation(
+                "Client software stage {Stage}: offered={OfferedCount}, sql_truncated={SqlTruncated}, response_truncated={ResponseTruncated}.",
+                stage,
+                response.NewUpdates?.Length ?? 0,
+                truncated,
+                response.Truncated);
             return true;
         }
 

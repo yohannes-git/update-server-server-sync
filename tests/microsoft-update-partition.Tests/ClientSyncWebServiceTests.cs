@@ -25,12 +25,19 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Tests
 
         private static Guid Id(SoftwareUpdate update) => ((MicrosoftUpdatePackageIdentity)update.Id).ID;
 
-        private static ClientSyncWebService CreateService(IClientSyncMetadataStore metadataSource)
+        private static ClientSyncWebService CreateService(
+            IClientSyncMetadataStore metadataSource,
+            Microsoft.Extensions.Logging.ILogger? logger = null)
         {
             var service = new ClientSyncWebService();
             service.SetContentURLBase(null);
             service.SetServiceConfiguration(new Config());
             service.SetPackageStore(metadataSource);
+            if (logger != null)
+            {
+                service.SetLogger(logger);
+            }
+
             return service;
         }
 
@@ -186,6 +193,28 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Tests
             Assert.NotNull(result.Updates);
             var update = Assert.Single(result.Updates);
             Assert.Contains("Known Update Title", update.Xml);
+        }
+
+        [Fact]
+        public async Task StaleIdentityWarningReachesConfiguredLogger()
+        {
+            using var tempPath = new TempStorePath();
+            AddAndPublish(tempPath.Path);
+            using var metadataSource = PackageStore.OpenClientSync(tempPath.Path);
+            var logger = new CapturingLogger();
+            var service = CreateService(metadataSource, logger);
+            var staleIdentity = new UpdateIdentity { UpdateID = Guid.NewGuid(), RevisionNumber = 1 };
+
+            await service.GetExtendedUpdateInfo2Async(
+                cookie: null,
+                updateIDs: new[] { staleIdentity },
+                infoTypes: new[] { XmlUpdateFragmentType.LocalizedProperties },
+                locales: new[] { "en" },
+                deviceAttributes: null);
+
+            var entry = Assert.Single(logger.Entries);
+            Assert.Equal(Microsoft.Extensions.Logging.LogLevel.Warning, entry.Level);
+            Assert.Contains("stale client update identity", entry.Message, StringComparison.OrdinalIgnoreCase);
         }
 
         [Fact]

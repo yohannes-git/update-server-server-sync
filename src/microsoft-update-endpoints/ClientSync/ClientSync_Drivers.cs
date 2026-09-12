@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+using Microsoft.Extensions.Logging;
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata;
 using Microsoft.PackageGraph.MicrosoftUpdate.Metadata.Drivers;
 using Microsoft.PackageGraph.Storage;
@@ -158,10 +159,12 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Endpoints.ClientSync
             }
 
             syncResult.NewUpdates = driverUpdates.ToArray();
-            System.Diagnostics.Trace.TraceInformation(
-                $"Client driver sync: devices={parameters.SystemSpec?.Length ?? 0}, " +
-                $"offered={driverUpdates.Count}, unapproved={unapprovedDriversMatched.Count}, " +
-                $"truncated={syncResult.Truncated}.");
+            _logger.LogInformation(
+                "Client driver sync: devices={DeviceCount}, offered={OfferedCount}, unapproved={UnapprovedCount}, truncated={Truncated}.",
+                parameters.SystemSpec?.Length ?? 0,
+                driverUpdates.Count,
+                unapprovedDriversMatched.Count,
+                syncResult.Truncated);
             return Task.FromResult(syncResult);
         }
 
