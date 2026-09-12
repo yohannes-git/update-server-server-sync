@@ -31,6 +31,7 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
                 typeof(CompactStoreOptions),
                 typeof(ObservedInventoryStatusOptions),
                 typeof(PruneObservedInventoryOptions),
+                typeof(PruneSupersededOptions),
                 typeof(MatchDriverOptions),
                 typeof(MetadataCopyOptions),
                 typeof(StoreAliasListOptions),
@@ -88,6 +89,9 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
                     break;
                 case PruneObservedInventoryOptions value:
                     ObservedInventoryMaintenanceCommand.Prune(value);
+                    break;
+                case PruneSupersededOptions value:
+                    SupersededPruneMaintenanceCommand.Prune(value);
                     break;
                 case QueryMetadataOptions value:
                     MetadataQuery.Query(value);

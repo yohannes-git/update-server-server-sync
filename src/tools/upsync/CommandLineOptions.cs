@@ -417,6 +417,28 @@ namespace Microsoft.PackageGraph.Utilitites.Upsync
         public bool DryRun { get; set; }
     }
 
+    [Verb("prune-superseded", HelpText = "Deletes stored software updates that have been superseded for a while and are no longer needed")]
+    public class PruneSupersededOptions : IMetadataStoreOptions
+    {
+        [Option("store-alias", Required = false, HelpText = "Store alias")]
+        public string Alias { get; set; }
+
+        [Option("store-path", Required = false, HelpText = "Store containing superseded updates")]
+        public string Path { get; set; }
+
+        [Option("store-type", Required = false, Default = "local", HelpText = "Store type; pruning currently requires a local SQLite store")]
+        public string Type { get; set; }
+
+        [Option("connection-string", Required = false, HelpText = "Unused for local superseded pruning")]
+        public string StoreConnectionString { get; set; }
+
+        [Option("superseded-for-days", Required = false, Default = 30, HelpText = "Only delete updates whose replacement has been present in the store for at least this many days")]
+        public int SupersededForDays { get; set; }
+
+        [Option("dry-run", Required = false, Default = false, HelpText = "Show how many updates would be deleted without modifying SQLite")]
+        public bool DryRun { get; set; }
+    }
+
     [Verb("query", HelpText = "Query package metadata from a package store")]
     public class QueryMetadataOptions : IMetadataStoreOptions, IMetadataFilterOptions
     {
