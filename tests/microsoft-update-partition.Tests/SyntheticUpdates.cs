@@ -79,7 +79,7 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Tests
             var filesCollection = new Dictionary<string, UpdateFileUrl>();
             foreach (var (digest, fileName) in spec.Files)
             {
-                filesXml.Append($@"<upd:File FileName=""{fileName}"" Digest=""{digest}"" DigestAlgorithm=""SHA256"" Size=""100"" Modified=""2024-01-01T00:00:00Z"" PatchingType=""full"" />");
+                filesXml.Append($@"<upd:File FileName=""{fileName}"" Digest=""{digest}"" DigestAlgorithm=""SHA1"" Size=""100"" Modified=""2024-01-01T00:00:00Z"" PatchingType=""full"" />");
                 filesCollection[digest] = new UpdateFileUrl(digest, $"http://mu/{fileName}", null);
             }
 
