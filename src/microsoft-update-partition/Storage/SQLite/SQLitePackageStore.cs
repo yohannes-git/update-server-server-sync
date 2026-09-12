@@ -54,8 +54,6 @@ namespace Microsoft.PackageGraph.Storage.Local
         private readonly SqliteConnection Connection;
         private readonly ReaderWriterLockSlim StateLock = new(LockRecursionPolicy.SupportsRecursion);
 
-        private Dictionary<IPackageIdentity, int> _IdentityToIndexMap = new();
-        private Dictionary<int, IPackageIdentity> _IndexToIdentityMap = new();
         private Dictionary<int, int> _PackageTypeIndex = new();
 
         private int _NextPackageIndex;
@@ -80,7 +78,7 @@ namespace Microsoft.PackageGraph.Storage.Local
         public event EventHandler<PackageStoreEventArgs> PackagesAddProgress;
         public event EventHandler<PackageStoreEventArgs> PackageIndexingProgress;
 
-        public int PackageCount => _IdentityToIndexMap.Count;
+        public int PackageCount => (int)CountPackages();
 
         /// <inheritdoc cref="IMetadataStore.IsReindexingRequired"/>
         public bool IsReindexingRequired => _IsReindexingRequired;
@@ -603,8 +601,6 @@ WHERE type = 'table'
             StateLock.EnterWriteLock();
             try
             {
-                _IdentityToIndexMap = new Dictionary<IPackageIdentity, int>();
-                _IndexToIdentityMap = new Dictionary<int, IPackageIdentity>();
                 _PackageTypeIndex = new Dictionary<int, int>();
 
                 var progressArgs = new PackageStoreEventArgs { Total = CountPackages(), Current = 0 };
@@ -612,7 +608,7 @@ WHERE type = 'table'
 
                 using var command = Connection.CreateCommand();
                 command.CommandText = @"
-SELECT package_index, identity, package_type
+SELECT package_index, package_type
 FROM packages
 ORDER BY package_index;";
 
@@ -620,12 +616,8 @@ ORDER BY package_index;";
                 while (reader.Read())
                 {
                     var packageIndex = reader.GetInt32(0);
-                    var identityString = reader.GetString(1);
-                    var packageType = reader.GetInt32(2);
-                    var identity = IdentityFromString(identityString);
+                    var packageType = reader.GetInt32(1);
 
-                    _IndexToIdentityMap.Add(packageIndex, identity);
-                    _IdentityToIndexMap.Add(identity, packageIndex);
                     _PackageTypeIndex.Add(packageIndex, packageType);
 
                     progressArgs.Current++;
@@ -635,7 +627,7 @@ ORDER BY package_index;";
                     }
                 }
 
-                _NextPackageIndex = _IndexToIdentityMap.Count == 0 ? 0 : _IndexToIdentityMap.Keys.Max() + 1;
+                _NextPackageIndex = _PackageTypeIndex.Count == 0 ? 0 : _PackageTypeIndex.Keys.Max() + 1;
                 OpenProgress?.Invoke(this, progressArgs);
             }
             finally
@@ -649,6 +641,72 @@ ORDER BY package_index;";
             using var command = Connection.CreateCommand();
             command.CommandText = "SELECT COUNT(*) FROM packages;";
             return (long)command.ExecuteScalar();
+        }
+
+        private bool TryGetPackageIndex(IPackageIdentity identity, out int packageIndex, SqliteTransaction transaction = null)
+        {
+            using var command = Connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = "SELECT package_index FROM packages WHERE identity = $identity;";
+            command.Parameters.AddWithValue("$identity", identity.ToString());
+            var value = command.ExecuteScalar();
+            if (value == null || value == DBNull.Value)
+            {
+                packageIndex = -1;
+                return false;
+            }
+
+            packageIndex = Convert.ToInt32((long)value);
+            return true;
+        }
+
+        private bool TryGetPackageIdentity(int packageIndex, out IPackageIdentity identity, SqliteTransaction transaction = null)
+        {
+            using var command = Connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = "SELECT identity FROM packages WHERE package_index = $packageIndex;";
+            command.Parameters.AddWithValue("$packageIndex", packageIndex);
+            var value = command.ExecuteScalar();
+            if (value == null || value == DBNull.Value)
+            {
+                identity = null;
+                return false;
+            }
+
+            identity = IdentityFromString((string)value);
+            return true;
+        }
+
+        private List<IPackageIdentity> FilterIdentitiesNotInStore(List<IPackageIdentity> candidates, SqliteTransaction transaction = null)
+        {
+            if (candidates.Count == 0)
+            {
+                return candidates;
+            }
+
+            var existing = new HashSet<string>(StringComparer.Ordinal);
+            const int chunkSize = 500;
+            for (var offset = 0; offset < candidates.Count; offset += chunkSize)
+            {
+                var chunk = candidates.Skip(offset).Take(chunkSize).ToList();
+                using var command = Connection.CreateCommand();
+                command.Transaction = transaction;
+                var parameterNames = new string[chunk.Count];
+                for (var i = 0; i < chunk.Count; i++)
+                {
+                    parameterNames[i] = $"$id{i}";
+                    command.Parameters.AddWithValue(parameterNames[i], chunk[i].ToString());
+                }
+
+                command.CommandText = $"SELECT identity FROM packages WHERE identity IN ({string.Join(",", parameterNames)});";
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    existing.Add(reader.GetString(0));
+                }
+            }
+
+            return candidates.Where(identity => !existing.Contains(identity.ToString())).ToList();
         }
 
         private static IPackageIdentity IdentityFromString(string identityString)
@@ -683,14 +741,14 @@ ORDER BY package_index;";
             else
             {
                 Indexes = ZipStreamIndexContainer.Create();
-                _IsReindexingRequired = _IdentityToIndexMap.Count > 0;
+                _IsReindexingRequired = _PackageTypeIndex.Count > 0;
             }
 
             var indexedPackageCountString = ReadProperty("indexed_package_count");
             if (!int.TryParse(indexedPackageCountString, out var indexedPackageCount) ||
-                indexedPackageCount != _IdentityToIndexMap.Count)
+                indexedPackageCount != _PackageTypeIndex.Count)
             {
-                _IsReindexingRequired = _IdentityToIndexMap.Count > 0;
+                _IsReindexingRequired = _PackageTypeIndex.Count > 0;
             }
         }
 
@@ -980,7 +1038,7 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
             command.Parameters.AddWithValue("$value", indexBytes);
             command.ExecuteNonQuery();
 
-            WriteProperty("indexed_package_count", _IdentityToIndexMap.Count.ToString());
+            WriteProperty("indexed_package_count", _PackageTypeIndex.Count.ToString());
 
             Indexes.CloseInput();
             IndexBackingStream?.Dispose();
@@ -2377,9 +2435,7 @@ VALUES ($anchorKey, $identifierType, $identifier);";
                 .Where(identity => identity != null)
                 .Distinct()
                 .ToList();
-            var identities = requestedIdentities
-                .Where(identity => !_IdentityToIndexMap.ContainsKey(identity))
-                .ToList();
+            var identities = FilterIdentitiesNotInStore(requestedIdentities, transaction);
             var now = DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);
 
             using (var existenceCommand = Connection.CreateCommand())
@@ -3031,7 +3087,7 @@ WHERE anchor_key = $anchorKey;";
             StateLock.EnterReadLock();
             try
             {
-                return _IdentityToIndexMap.ContainsKey(packageIdentity);
+                return TryGetPackageIndex(packageIdentity, out _);
             }
             finally
             {
@@ -3049,10 +3105,16 @@ WHERE anchor_key = $anchorKey;";
             StateLock.EnterReadLock();
             try
             {
-                return _IndexToIdentityMap
-                    .OrderBy(pair => pair.Key)
-                    .Select(pair => pair.Value)
-                    .ToList();
+                var identities = new List<IPackageIdentity>();
+                using var command = Connection.CreateCommand();
+                command.CommandText = "SELECT identity FROM packages ORDER BY package_index;";
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    identities.Add(IdentityFromString(reader.GetString(0)));
+                }
+
+                return identities;
             }
             finally
             {
@@ -3065,7 +3127,7 @@ WHERE anchor_key = $anchorKey;";
             StateLock.EnterReadLock();
             try
             {
-                return _IdentityToIndexMap.TryGetValue(packageIdentity, out var packageIndex) ? packageIndex : -1;
+                return TryGetPackageIndex(packageIdentity, out var packageIndex) ? packageIndex : -1;
             }
             finally
             {
@@ -3078,7 +3140,7 @@ WHERE anchor_key = $anchorKey;";
             StateLock.EnterReadLock();
             try
             {
-                if (!_IdentityToIndexMap.TryGetValue(packageIdentity, out var packageIndex))
+                if (!TryGetPackageIndex(packageIdentity, out var packageIndex))
                 {
                     throw new KeyNotFoundException();
                 }
@@ -3096,7 +3158,7 @@ WHERE anchor_key = $anchorKey;";
             StateLock.EnterReadLock();
             try
             {
-                if (!_IndexToIdentityMap.TryGetValue(packageIndex, out var packageIdentity))
+                if (!TryGetPackageIdentity(packageIndex, out var packageIdentity))
                 {
                     throw new KeyNotFoundException();
                 }
@@ -3121,7 +3183,11 @@ WHERE anchor_key = $anchorKey;";
 
         private IPackage CreatePackageFromStoredMetadata(int packageIndex)
         {
-            var packageIdentity = _IndexToIdentityMap[packageIndex];
+            if (!TryGetPackageIdentity(packageIndex, out var packageIdentity))
+            {
+                throw new KeyNotFoundException();
+            }
+
             if (PartitionRegistration.TryGetPartitionFromPackageId(packageIdentity, out var partitionDefinition))
             {
                 var metadataBytes = ReadMetadataBytes(packageIndex);
@@ -3137,7 +3203,7 @@ WHERE anchor_key = $anchorKey;";
             StateLock.EnterReadLock();
             try
             {
-                if (!_IdentityToIndexMap.TryGetValue(packageIdentity, out var packageIndex))
+                if (!TryGetPackageIndex(packageIdentity, out var packageIndex))
                 {
                     throw new KeyNotFoundException();
                 }
@@ -3175,7 +3241,7 @@ WHERE package_index = $packageIndex;";
             StateLock.EnterReadLock();
             try
             {
-                if (!_IdentityToIndexMap.TryGetValue(packageIdentity, out var packageIndex))
+                if (!TryGetPackageIndex(packageIdentity, out var packageIndex))
                 {
                     throw new KeyNotFoundException();
                 }
@@ -3431,7 +3497,8 @@ WHERE sha1_base64 = $sha1;";
 
                 foreach (var package in packages)
                 {
-                    if (package == null || _IdentityToIndexMap.ContainsKey(package.Id) || stagedIdentities.Contains(package.Id))
+                    if (package == null || stagedIdentities.Contains(package.Id) ||
+                        TryGetPackageIndex(package.Id, out _, transaction))
                     {
                         continue;
                     }
@@ -3485,8 +3552,6 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
 
                 foreach (var stagedPackage in stagedPackages)
                 {
-                    _IdentityToIndexMap.Add(stagedPackage.Identity, stagedPackage.PackageIndex);
-                    _IndexToIdentityMap.Add(stagedPackage.PackageIndex, stagedPackage.Identity);
                     _PackageTypeIndex.Add(stagedPackage.PackageIndex, stagedPackage.PackageType);
                     Indexes.IndexPackage(stagedPackage.Package, stagedPackage.PackageIndex);
                     PendingPackages.Add(stagedPackage.Package);
@@ -4420,25 +4485,24 @@ VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, NULL, NULL, NULL, $pack
                 // Build the complete replacement state first. The currently loaded
                 // maps and index container remain usable if any read/validation step
                 // fails, so the update server can continue serving its old generation.
-                var replacementIdentityToIndex = new Dictionary<IPackageIdentity, int>();
-                var replacementIndexToIdentity = new Dictionary<int, IPackageIdentity>();
                 var replacementPackageTypes = new Dictionary<int, int>();
+                var replacementPackageCount = 0;
+                var replacementMaxPackageIndex = -1;
 
                 using (var packageCommand = Connection.CreateCommand())
                 {
                     packageCommand.CommandText = @"
-SELECT package_index, identity, package_type
+SELECT package_index, package_type
 FROM packages
 ORDER BY package_index;";
                     using var reader = packageCommand.ExecuteReader();
                     while (reader.Read())
                     {
                         var packageIndex = reader.GetInt32(0);
-                        var identity = IdentityFromString(reader.GetString(1));
-                        var packageType = reader.GetInt32(2);
-                        replacementIdentityToIndex.Add(identity, packageIndex);
-                        replacementIndexToIdentity.Add(packageIndex, identity);
+                        var packageType = reader.GetInt32(1);
                         replacementPackageTypes.Add(packageIndex, packageType);
+                        replacementPackageCount++;
+                        replacementMaxPackageIndex = packageIndex;
                     }
                 }
 
@@ -4460,7 +4524,7 @@ ORDER BY package_index;";
                     else
                     {
                         replacementIndexes = ZipStreamIndexContainer.Create();
-                        if (replacementIdentityToIndex.Count > 0)
+                        if (replacementPackageCount > 0)
                         {
                             throw new InvalidDataException(
                                 "The newly published catalog contains packages but no metadata index.");
@@ -4473,22 +4537,18 @@ ORDER BY package_index;";
                             NumberStyles.Integer,
                             CultureInfo.InvariantCulture,
                             out var indexedPackageCount)
-                        || indexedPackageCount != replacementIdentityToIndex.Count)
+                        || indexedPackageCount != replacementPackageCount)
                     {
                         throw new InvalidDataException(
                             $"The newly published metadata index covers {indexedPackageCountValue ?? "an unknown number of"} " +
-                            $"package(s), while SQLite contains {replacementIdentityToIndex.Count}.");
+                            $"package(s), while SQLite contains {replacementPackageCount}.");
                     }
 
                     var previousIndexes = Indexes;
                     var previousIndexStream = IndexBackingStream;
 
-                    _IdentityToIndexMap = replacementIdentityToIndex;
-                    _IndexToIdentityMap = replacementIndexToIdentity;
                     _PackageTypeIndex = replacementPackageTypes;
-                    _NextPackageIndex = replacementIndexToIdentity.Count == 0
-                        ? 0
-                        : replacementIndexToIdentity.Keys.Max() + 1;
+                    _NextPackageIndex = replacementMaxPackageIndex + 1;
                     Indexes = replacementIndexes;
                     IndexBackingStream = replacementIndexStream;
                     replacementIndexes = null;
@@ -4567,11 +4627,11 @@ ORDER BY package_index;";
 
                 var progressEvent = new PackageStoreEventArgs
                 {
-                    Total = _IdentityToIndexMap.Count,
+                    Total = _PackageTypeIndex.Count,
                     Current = 0
                 };
 
-                foreach (var packageIndex in _IndexToIdentityMap.Keys.OrderBy(i => i).ToList())
+                foreach (var packageIndex in _PackageTypeIndex.Keys.OrderBy(i => i).ToList())
                 {
                     var parsedPackage = CreatePackageFromStoredMetadata(packageIndex);
                     Indexes.IndexPackage(parsedPackage, packageIndex);
@@ -4678,7 +4738,7 @@ ORDER BY package_index;";
             StateLock.EnterReadLock();
             try
             {
-                if (!_IdentityToIndexMap.TryGetValue(packageIdentity, out var packageIndex))
+                if (!TryGetPackageIndex(packageIdentity, out var packageIndex))
                 {
                     throw new KeyNotFoundException();
                 }
@@ -4696,7 +4756,7 @@ ORDER BY package_index;";
             StateLock.EnterReadLock();
             try
             {
-                if (!_IdentityToIndexMap.TryGetValue(packageIdentity, out var packageIndex))
+                if (!TryGetPackageIndex(packageIdentity, out var packageIndex))
                 {
                     throw new KeyNotFoundException();
                 }
@@ -4723,7 +4783,7 @@ ORDER BY package_index;";
             {
                 if (Indexes.TryPackageLookupByCustomKey(key, indexName, out var packageIndex))
                 {
-                    return _IndexToIdentityMap.TryGetValue(packageIndex, out value);
+                    return TryGetPackageIdentity(packageIndex, out value);
                 }
 
                 value = null;
@@ -4743,8 +4803,8 @@ ORDER BY package_index;";
                 if (Indexes.TryPackageListLookupByCustomKey(key, indexName, out List<int> packageIndexes))
                 {
                     value = packageIndexes
-                        .Where(packageIndex => _IndexToIdentityMap.ContainsKey(packageIndex))
-                        .Select(packageIndex => _IndexToIdentityMap[packageIndex])
+                        .Select(packageIndex => TryGetPackageIdentity(packageIndex, out var identity) ? identity : null)
+                        .Where(identity => identity != null)
                         .ToList();
                     return true;
                 }
@@ -4797,8 +4857,6 @@ ORDER BY package_index;";
                 IndexBackingStream?.Dispose();
                 Connection?.Dispose();
 
-                _IndexToIdentityMap.Clear();
-                _IdentityToIndexMap.Clear();
                 _PackageTypeIndex.Clear();
                 PendingPackages.Clear();
 
