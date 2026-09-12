@@ -41,4 +41,8 @@
     <ProjectReference Include="..\microsoft-update-webservices\microsoft-update-webservices.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="microsoft-update-partition.Tests" />
+  </ItemGroup>
+
 </Project>
