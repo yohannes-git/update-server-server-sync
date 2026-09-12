@@ -16,6 +16,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\microsoft-update-partition\microsoft-update-partition.csproj" />
+    <ProjectReference Include="..\..\src\microsoft-update-endpoints\microsoft-update-endpoints.csproj" />
   </ItemGroup>
 
   <ItemGroup>
