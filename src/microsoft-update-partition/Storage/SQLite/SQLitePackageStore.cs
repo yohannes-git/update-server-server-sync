@@ -64,7 +64,10 @@ namespace Microsoft.PackageGraph.Storage.Local
         private bool IsCatalogGenerationPublicationDeferred;
         private MetadataStoreGenerationInfo LoadedMetadataGeneration;
 
-        private readonly List<IPackage> PendingPackages = new();
+        // Only src/samples' demo reads this back (via GetPendingPackages, for a count/preview);
+        // the real upsync CLI fetch paths never do. Track indices, not full parsed packages, so
+        // a large fetch doesn't hold every package twice (once in SQLite, once here) until Flush().
+        private readonly List<int> PendingPackageIndices = new();
 
         private static readonly List<IndexDefinition> KnownPropertyIndexes = new()
         {
@@ -3673,7 +3676,7 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
                 foreach (var stagedPackage in stagedPackages)
                 {
                     _PackageTypeIndex.Add(stagedPackage.PackageIndex, stagedPackage.PackageType);
-                    PendingPackages.Add(stagedPackage.Package);
+                    PendingPackageIndices.Add(stagedPackage.PackageIndex);
                 }
 
                 _NextPackageIndex += stagedPackages.Count;
@@ -4561,7 +4564,7 @@ VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, NULL, NULL, NULL, $pack
                 if (IsDirty)
                 {
                     IsDirty = false;
-                    PendingPackages.Clear();
+                    PendingPackageIndices.Clear();
                 }
 
                 if (CatalogGenerationDirty)
@@ -4617,7 +4620,7 @@ ORDER BY package_index;";
 
                 _PackageTypeIndex = replacementPackageTypes;
                 _NextPackageIndex = replacementMaxPackageIndex + 1;
-                PendingPackages.Clear();
+                PendingPackageIndices.Clear();
                 IsDirty = false;
                 CatalogGenerationDirty = false;
                 _IsReindexingRequired = false;
@@ -4638,7 +4641,7 @@ ORDER BY package_index;";
                 if (IsDirty)
                 {
                     IsDirty = false;
-                    PendingPackages.Clear();
+                    PendingPackageIndices.Clear();
                 }
 
                 if (CatalogGenerationDirty && !IsCatalogGenerationPublicationDeferred)
@@ -4737,7 +4740,10 @@ ORDER BY package_index;";
             StateLock.EnterReadLock();
             try
             {
-                return PendingPackages.ToList().AsReadOnly();
+                return PendingPackageIndices
+                    .Select(packageIndex => CreatePackageFromStoredMetadata(packageIndex))
+                    .ToList()
+                    .AsReadOnly();
             }
             finally
             {
@@ -4962,7 +4968,7 @@ WHERE index_name = $indexName AND key_text = $keyText;";
                 Connection?.Dispose();
 
                 _PackageTypeIndex.Clear();
-                PendingPackages.Clear();
+                PendingPackageIndices.Clear();
 
                 IsDisposed = true;
             }

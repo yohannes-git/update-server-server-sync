@@ -78,5 +78,25 @@ namespace Microsoft.PackageGraph.MicrosoftUpdate.Tests
             Assert.Contains(first.Id, identities);
             Assert.Contains(second.Id, identities);
         }
+
+        [Fact]
+        public void GetPendingPackagesReturnsAddedPackagesUntilFlush()
+        {
+            using var tempPath = new TempStorePath();
+            var first = SyntheticUpdates.BuildSoftwareUpdate(new SyntheticUpdates.SoftwareUpdateSpec());
+            var second = SyntheticUpdates.BuildSoftwareUpdate(new SyntheticUpdates.SoftwareUpdateSpec());
+
+            using var store = SQLitePackageStore.OpenOrCreate(tempPath.Path);
+            store.AddPackages(new IPackage[] { first, second });
+
+            var pending = store.GetPendingPackages();
+            Assert.Equal(2, pending.Count);
+            Assert.Contains(pending, p => p.Id.Equals(first.Id));
+            Assert.Contains(pending, p => p.Id.Equals(second.Id));
+
+            store.Flush();
+
+            Assert.Empty(store.GetPendingPackages());
+        }
     }
 }
