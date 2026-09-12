@@ -38,8 +38,7 @@ namespace Microsoft.PackageGraph.Storage.Local
     {
         public const string DatabaseFileName = "metadata.sqlite";
 
-        private const int SchemaVersion = 10;
-        private const string IndexBlobKey = "indexes.zip";
+        private const int SchemaVersion = 11;
         private const string CompressionNone = "none";
         private const string CompressionBrotli = "br";
         private const string CompressionGZip = "gzip";
@@ -58,7 +57,6 @@ namespace Microsoft.PackageGraph.Storage.Local
 
         private int _NextPackageIndex;
         private bool IsDirty;
-        private bool IsIndexDirty;
         private bool IsDisposed;
         private bool _IsReindexingRequired;
         private bool _FileLocationFileJsonIsRequired;
@@ -66,10 +64,21 @@ namespace Microsoft.PackageGraph.Storage.Local
         private bool IsCatalogGenerationPublicationDeferred;
         private MetadataStoreGenerationInfo LoadedMetadataGeneration;
 
-        private MemoryStream IndexBackingStream;
-        private ZipStreamIndexContainer Indexes;
-
         private readonly List<IPackage> PendingPackages = new();
+
+        private static readonly List<IndexDefinition> KnownPropertyIndexes = new()
+        {
+            Microsoft.PackageGraph.Storage.Index.TitlesIndex.TitlesIndexDefinition,
+            Microsoft.PackageGraph.MicrosoftUpdate.MicrosoftUpdatePartitionRegistration.KbArticle,
+            Microsoft.PackageGraph.MicrosoftUpdate.MicrosoftUpdatePartitionRegistration.Categories,
+            Microsoft.PackageGraph.MicrosoftUpdate.MicrosoftUpdatePartitionRegistration.Prerequisites,
+            Microsoft.PackageGraph.MicrosoftUpdate.MicrosoftUpdatePartitionRegistration.Files,
+            Microsoft.PackageGraph.MicrosoftUpdate.MicrosoftUpdatePartitionRegistration.IsSuperseding,
+            Microsoft.PackageGraph.MicrosoftUpdate.MicrosoftUpdatePartitionRegistration.IsSuperseded,
+            Microsoft.PackageGraph.MicrosoftUpdate.MicrosoftUpdatePartitionRegistration.IsBundle,
+            Microsoft.PackageGraph.MicrosoftUpdate.MicrosoftUpdatePartitionRegistration.BundledWith,
+            Microsoft.PackageGraph.MicrosoftUpdate.MicrosoftUpdatePartitionRegistration.DriverMetadata,
+        };
 
 #pragma warning disable 0067
         public event EventHandler<PackageStoreEventArgs> MetadataCopyProgress;
@@ -139,6 +148,7 @@ namespace Microsoft.PackageGraph.Storage.Local
             else
             {
                 ClientSyncFragmentSchemaMigrator.TryMigrate(Connection);
+                PropertyIndexSchemaMigrator.TryMigrate(Connection);
                 ValidateExistingSchema();
             }
 
@@ -147,7 +157,8 @@ namespace Microsoft.PackageGraph.Storage.Local
             CatalogGenerationDirty =
                 string.Equals(ReadProperty(CatalogUnpublishedChangesKey), "1", StringComparison.Ordinal);
             LoadPackageMaps();
-            LoadIndexes();
+            _IsReindexingRequired = _PackageTypeIndex.Count > 0
+                && !string.Equals(ReadProperty("property_index_built"), "1", StringComparison.Ordinal);
             LoadedMetadataGeneration = ReadMetadataGenerationInfo();
 
             if (autoReindex && _IsReindexingRequired)
@@ -476,6 +487,25 @@ CREATE TABLE IF NOT EXISTS observed_fetch_runs (
 CREATE INDEX IF NOT EXISTS idx_observed_fetch_runs_started_at
 ON observed_fetch_runs(started_at DESC);
 
+CREATE TABLE IF NOT EXISTS package_property_cache (
+    package_index INTEGER NOT NULL,
+    property_name TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    PRIMARY KEY(package_index, property_name),
+    FOREIGN KEY(package_index) REFERENCES packages(package_index) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS package_custom_key_index (
+    index_name TEXT NOT NULL,
+    key_text TEXT NOT NULL,
+    package_index INTEGER NOT NULL,
+    PRIMARY KEY(index_name, key_text, package_index),
+    FOREIGN KEY(package_index) REFERENCES packages(package_index) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_package_custom_key_index_lookup
+ON package_custom_key_index(index_name, key_text);
+
 INSERT OR IGNORE INTO store_properties(key, value)
 VALUES ('catalog_generation', '0');
 
@@ -487,6 +517,9 @@ VALUES ('catalog_publication_deferred', '0');
 
 INSERT OR IGNORE INTO store_properties(key, value)
 VALUES ('catalog_unpublished_changes', '0');
+
+INSERT OR IGNORE INTO store_properties(key, value)
+VALUES ('property_index_built', '1');
 ");
 
             using var command = Connection.CreateCommand();
@@ -544,7 +577,9 @@ WHERE type = 'table'
                 "observed_detectoids",
                 "observed_pnp_hardware_ids",
                 "observed_compatible_ids",
-                "observed_computer_ids"
+                "observed_computer_ids",
+                "package_property_cache",
+                "package_custom_key_index"
             };
 
             using (var command = Connection.CreateCommand())
@@ -726,31 +761,6 @@ ORDER BY package_index;";
             throw new NotImplementedException($"The package belongs to a partition that was not registered: {partitionName}");
         }
 
-        private void LoadIndexes()
-        {
-            var indexData = ReadBlob(IndexBlobKey);
-            if (indexData != null && indexData.Length > 0)
-            {
-                IndexBackingStream = new MemoryStream(indexData, false);
-                Indexes = ZipStreamIndexContainer.Open(IndexBackingStream);
-                if (Indexes.GetStatus() != ZipStreamIndexContainer.IndexContainerStatus.Valid)
-                {
-                    _IsReindexingRequired = true;
-                }
-            }
-            else
-            {
-                Indexes = ZipStreamIndexContainer.Create();
-                _IsReindexingRequired = _PackageTypeIndex.Count > 0;
-            }
-
-            var indexedPackageCountString = ReadProperty("indexed_package_count");
-            if (!int.TryParse(indexedPackageCountString, out var indexedPackageCount) ||
-                indexedPackageCount != _PackageTypeIndex.Count)
-            {
-                _IsReindexingRequired = _PackageTypeIndex.Count > 0;
-            }
-        }
 
         private byte[] ReadBlob(string key)
         {
@@ -1023,34 +1033,142 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
             command.ExecuteNonQuery();
         }
 
-        private void WriteIndexes()
-        {
-            using var memoryStream = new MemoryStream();
-            Indexes.Save(memoryStream);
-            var indexBytes = memoryStream.ToArray();
-
-            using var command = Connection.CreateCommand();
-            command.CommandText = @"
-INSERT INTO store_blobs(key, value)
-VALUES ($key, $value)
-ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
-            command.Parameters.AddWithValue("$key", IndexBlobKey);
-            command.Parameters.AddWithValue("$value", indexBytes);
-            command.ExecuteNonQuery();
-
-            WriteProperty("indexed_package_count", _PackageTypeIndex.Count.ToString());
-
-            Indexes.CloseInput();
-            IndexBackingStream?.Dispose();
-            IndexBackingStream = new MemoryStream(indexBytes, false);
-            Indexes = ZipStreamIndexContainer.Open(IndexBackingStream);
-        }
-
         private void ExecuteNonQuery(string sql)
         {
             using var command = Connection.CreateCommand();
             command.CommandText = sql;
             command.ExecuteNonQuery();
+        }
+
+        private void WritePropertyIndexes(IPackage package, int packageIndex, SqliteTransaction transaction)
+        {
+            if (!string.IsNullOrEmpty(package.Title))
+            {
+                SetPropertyCache(packageIndex, Microsoft.PackageGraph.Storage.Index.AvailableIndexes.TitlesIndexName, package.Title, transaction);
+            }
+
+            if (package is SoftwareUpdate softwareUpdate)
+            {
+                if (!string.IsNullOrEmpty(softwareUpdate.KBArticleId))
+                {
+                    SetPropertyCache(packageIndex, Microsoft.PackageGraph.MicrosoftUpdate.Index.AvailableIndexes.KbArticleIndexName, softwareUpdate.KBArticleId, transaction);
+                }
+
+                if (softwareUpdate.SupersededUpdates != null && softwareUpdate.SupersededUpdates.Count > 0)
+                {
+                    SetPropertyCache(packageIndex, Microsoft.PackageGraph.MicrosoftUpdate.Index.AvailableIndexes.IsSupersedingIndexName, new List<Guid>(softwareUpdate.SupersededUpdates), transaction);
+                    foreach (var supersededId in softwareUpdate.SupersededUpdates)
+                    {
+                        AddCustomKeyEntry(Microsoft.PackageGraph.MicrosoftUpdate.Index.AvailableIndexes.IsSupersededIndexName, supersededId.ToString(), packageIndex, transaction);
+                    }
+                }
+
+                if (softwareUpdate.BundledUpdates != null && softwareUpdate.BundledUpdates.Count > 0)
+                {
+                    SetPropertyCache(packageIndex, Microsoft.PackageGraph.MicrosoftUpdate.Index.AvailableIndexes.IsBundleIndexName, softwareUpdate.BundledUpdates.ToList(), transaction);
+                    foreach (var bundledId in softwareUpdate.BundledUpdates)
+                    {
+                        AddCustomKeyEntry(Microsoft.PackageGraph.MicrosoftUpdate.Index.AvailableIndexes.BundledWithIndexName, bundledId.ToString(), packageIndex, transaction);
+                    }
+                }
+            }
+
+            if (package is MicrosoftUpdatePackage microsoftUpdate && microsoftUpdate.Prerequisites != null)
+            {
+                if (microsoftUpdate.Prerequisites.Count > 0)
+                {
+                    var prerequisiteGuids = new List<List<Guid>>();
+                    foreach (var prereq in microsoftUpdate.Prerequisites)
+                    {
+                        if (prereq is Simple simple)
+                        {
+                            prerequisiteGuids.Add(new List<Guid>() { simple.UpdateId });
+                        }
+                        else if (prereq is AtLeastOne atLeastOne)
+                        {
+                            var group = new List<Guid>(atLeastOne.Simple.Select(s => s.UpdateId));
+                            if (atLeastOne.IsCategory)
+                            {
+                                // Guid.Empty marks the group as a category prerequisite; matches
+                                // the encoding the legacy PrerequisitesIndex used.
+                                group.Add(Guid.Empty);
+                            }
+
+                            prerequisiteGuids.Add(group);
+                        }
+                    }
+
+                    SetPropertyCache(packageIndex, Microsoft.PackageGraph.MicrosoftUpdate.Index.AvailableIndexes.PrerequisitesIndexName, prerequisiteGuids, transaction);
+                }
+
+                var categoryGuids = new List<Guid>();
+                foreach (var prereq in microsoftUpdate.Prerequisites.OfType<AtLeastOne>().Where(p => p.IsCategory))
+                {
+                    categoryGuids.AddRange(prereq.Simple.Select(s => s.UpdateId));
+                }
+
+                if (categoryGuids.Count > 0)
+                {
+                    SetPropertyCache(packageIndex, Microsoft.PackageGraph.MicrosoftUpdate.Index.AvailableIndexes.CategoriesIndexName, categoryGuids, transaction);
+                }
+            }
+
+            if (package is DriverUpdate driverUpdate)
+            {
+                var driverMetadata = driverUpdate.GetDriverMetadata().ToList();
+                if (driverMetadata.Count > 0)
+                {
+                    SetPropertyCache(packageIndex, Microsoft.PackageGraph.MicrosoftUpdate.Index.AvailableIndexes.DriverMetadataIndexName, driverMetadata, transaction);
+                }
+            }
+        }
+
+        private void SetPropertyCache<T>(int packageIndex, string propertyName, T value, SqliteTransaction transaction)
+        {
+            using var command = Connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"
+INSERT INTO package_property_cache(package_index, property_name, value_json)
+VALUES ($packageIndex, $propertyName, $valueJson)
+ON CONFLICT(package_index, property_name) DO UPDATE SET value_json = excluded.value_json;";
+            command.Parameters.AddWithValue("$packageIndex", packageIndex);
+            command.Parameters.AddWithValue("$propertyName", propertyName);
+            command.Parameters.AddWithValue("$valueJson", JsonConvert.SerializeObject(value));
+            command.ExecuteNonQuery();
+        }
+
+        private void AddCustomKeyEntry(string indexName, string keyText, int packageIndex, SqliteTransaction transaction)
+        {
+            using var command = Connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"
+INSERT OR IGNORE INTO package_custom_key_index(index_name, key_text, package_index)
+VALUES ($indexName, $keyText, $packageIndex);";
+            command.Parameters.AddWithValue("$indexName", indexName);
+            command.Parameters.AddWithValue("$keyText", keyText);
+            command.Parameters.AddWithValue("$packageIndex", packageIndex);
+            command.ExecuteNonQuery();
+        }
+
+        private bool TryReadPropertyCache<T>(int packageIndex, string propertyName, out T value, SqliteTransaction transaction = null)
+        {
+            using var command = Connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"
+SELECT value_json
+FROM package_property_cache
+WHERE package_index = $packageIndex AND property_name = $propertyName;";
+            command.Parameters.AddWithValue("$packageIndex", packageIndex);
+            command.Parameters.AddWithValue("$propertyName", propertyName);
+            var result = command.ExecuteScalar();
+            if (result == null || result == DBNull.Value)
+            {
+                value = default;
+                return false;
+            }
+
+            value = JsonConvert.DeserializeObject<T>((string)result);
+            return true;
         }
 
         // Observed client inventory support. These operations are local-only and
@@ -3181,16 +3299,16 @@ WHERE anchor_key = $anchorKey;";
             throw new NotImplementedException($"The package belongs to a partition that was not registered: {packageIdentity.Partition}");
         }
 
-        private IPackage CreatePackageFromStoredMetadata(int packageIndex)
+        private IPackage CreatePackageFromStoredMetadata(int packageIndex, SqliteTransaction transaction = null)
         {
-            if (!TryGetPackageIdentity(packageIndex, out var packageIdentity))
+            if (!TryGetPackageIdentity(packageIndex, out var packageIdentity, transaction))
             {
                 throw new KeyNotFoundException();
             }
 
             if (PartitionRegistration.TryGetPartitionFromPackageId(packageIdentity, out var partitionDefinition))
             {
-                var metadataBytes = ReadMetadataBytes(packageIndex);
+                var metadataBytes = ReadMetadataBytes(packageIndex, transaction);
                 using var metadataStream = new MemoryStream(metadataBytes, false);
                 return partitionDefinition.Factory.FromStream(metadataStream, this);
             }
@@ -3216,9 +3334,10 @@ WHERE anchor_key = $anchorKey;";
             }
         }
 
-        private byte[] ReadMetadataBytes(int packageIndex)
+        private byte[] ReadMetadataBytes(int packageIndex, SqliteTransaction transaction = null)
         {
             using var command = Connection.CreateCommand();
+            command.Transaction = transaction;
             command.CommandText = @"
 SELECT metadata, COALESCE(metadata_compression, 'none')
 FROM packages
@@ -3517,6 +3636,7 @@ WHERE sha1_base64 = $sha1;";
                         metadataStorage.Compression,
                         transaction);
                     InsertFileLocations(package, packageIndex, transaction);
+                    WritePropertyIndexes(package, packageIndex, transaction);
 
                     stagedPackages.Add(new StagedPackage
                     {
@@ -3553,7 +3673,6 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
                 foreach (var stagedPackage in stagedPackages)
                 {
                     _PackageTypeIndex.Add(stagedPackage.PackageIndex, stagedPackage.PackageType);
-                    Indexes.IndexPackage(stagedPackage.Package, stagedPackage.PackageIndex);
                     PendingPackages.Add(stagedPackage.Package);
                 }
 
@@ -3562,7 +3681,6 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value;";
                 if (stagedPackages.Count > 0)
                 {
                     IsDirty = true;
-                    IsIndexDirty = true;
                     CatalogGenerationDirty = true;
                 }
 
@@ -4105,11 +4223,9 @@ VALUES ($packageIndex, $sha1Base64);";
 
                 if (rebuildIndexes)
                 {
-                    log?.Invoke("Rebuilding indexes without embedding the full file-location payload...");
+                    log?.Invoke("Rebuilding package_property_cache/package_custom_key_index...");
                     CheckIndex(true);
-                    WriteIndexes();
                     IsDirty = false;
-                    IsIndexDirty = false;
                 }
 
                 WriteProperty("schema_version", SchemaVersion.ToString());
@@ -4442,11 +4558,9 @@ VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, NULL, NULL, NULL, $pack
             StateLock.EnterWriteLock();
             try
             {
-                if (IsDirty || IsIndexDirty)
+                if (IsDirty)
                 {
-                    WriteIndexes();
                     IsDirty = false;
-                    IsIndexDirty = false;
                     PendingPackages.Clear();
                 }
 
@@ -4482,11 +4596,7 @@ VALUES ($sha1Base64, $sha1, $sha1Hex, $muUrl, $fileName, NULL, NULL, NULL, $pack
                     return false;
                 }
 
-                // Build the complete replacement state first. The currently loaded
-                // maps and index container remain usable if any read/validation step
-                // fails, so the update server can continue serving its old generation.
                 var replacementPackageTypes = new Dictionary<int, int>();
-                var replacementPackageCount = 0;
                 var replacementMaxPackageIndex = -1;
 
                 using (var packageCommand = Connection.CreateCommand())
@@ -4501,82 +4611,18 @@ ORDER BY package_index;";
                         var packageIndex = reader.GetInt32(0);
                         var packageType = reader.GetInt32(1);
                         replacementPackageTypes.Add(packageIndex, packageType);
-                        replacementPackageCount++;
                         replacementMaxPackageIndex = packageIndex;
                     }
                 }
 
-                MemoryStream replacementIndexStream = null;
-                ZipStreamIndexContainer replacementIndexes = null;
-                try
-                {
-                    var indexData = ReadBlob(IndexBlobKey);
-                    if (indexData != null && indexData.Length > 0)
-                    {
-                        replacementIndexStream = new MemoryStream(indexData, false);
-                        replacementIndexes = ZipStreamIndexContainer.Open(replacementIndexStream);
-                        if (replacementIndexes.GetStatus() != ZipStreamIndexContainer.IndexContainerStatus.Valid)
-                        {
-                            throw new InvalidDataException(
-                                "The newly published metadata index is invalid.");
-                        }
-                    }
-                    else
-                    {
-                        replacementIndexes = ZipStreamIndexContainer.Create();
-                        if (replacementPackageCount > 0)
-                        {
-                            throw new InvalidDataException(
-                                "The newly published catalog contains packages but no metadata index.");
-                        }
-                    }
-
-                    var indexedPackageCountValue = ReadProperty("indexed_package_count");
-                    if (!int.TryParse(
-                            indexedPackageCountValue,
-                            NumberStyles.Integer,
-                            CultureInfo.InvariantCulture,
-                            out var indexedPackageCount)
-                        || indexedPackageCount != replacementPackageCount)
-                    {
-                        throw new InvalidDataException(
-                            $"The newly published metadata index covers {indexedPackageCountValue ?? "an unknown number of"} " +
-                            $"package(s), while SQLite contains {replacementPackageCount}.");
-                    }
-
-                    var previousIndexes = Indexes;
-                    var previousIndexStream = IndexBackingStream;
-
-                    _PackageTypeIndex = replacementPackageTypes;
-                    _NextPackageIndex = replacementMaxPackageIndex + 1;
-                    Indexes = replacementIndexes;
-                    IndexBackingStream = replacementIndexStream;
-                    replacementIndexes = null;
-                    replacementIndexStream = null;
-                    PendingPackages.Clear();
-                    IsDirty = false;
-                    IsIndexDirty = false;
-                    CatalogGenerationDirty = false;
-                    _IsReindexingRequired = false;
-                    LoadedMetadataGeneration = persistentGeneration;
-
-                    try
-                    {
-                        previousIndexes?.CloseInput();
-                        previousIndexStream?.Dispose();
-                    }
-                    catch
-                    {
-                        // The replacement state is already active. Disposal of
-                        // the old read-only index stream is best-effort.
-                    }
-                    return true;
-                }
-                finally
-                {
-                    replacementIndexes?.CloseInput();
-                    replacementIndexStream?.Dispose();
-                }
+                _PackageTypeIndex = replacementPackageTypes;
+                _NextPackageIndex = replacementMaxPackageIndex + 1;
+                PendingPackages.Clear();
+                IsDirty = false;
+                CatalogGenerationDirty = false;
+                _IsReindexingRequired = false;
+                LoadedMetadataGeneration = persistentGeneration;
+                return true;
             }
             finally
             {
@@ -4589,11 +4635,9 @@ ORDER BY package_index;";
             StateLock.EnterWriteLock();
             try
             {
-                if (IsDirty || IsIndexDirty)
+                if (IsDirty)
                 {
-                    WriteIndexes();
                     IsDirty = false;
-                    IsIndexDirty = false;
                     PendingPackages.Clear();
                 }
 
@@ -4613,6 +4657,8 @@ ORDER BY package_index;";
             }
         }
 
+        private const int PropertyIndexRebuildBatchSize = 200;
+
         private void CheckIndex(bool forceReindex = false)
         {
             StateLock.EnterWriteLock();
@@ -4623,29 +4669,56 @@ ORDER BY package_index;";
                     return;
                 }
 
-                Indexes.ResetIndex();
-
+                var packageIndexes = _PackageTypeIndex.Keys.OrderBy(i => i).ToList();
                 var progressEvent = new PackageStoreEventArgs
                 {
-                    Total = _PackageTypeIndex.Count,
+                    Total = packageIndexes.Count,
                     Current = 0
                 };
 
-                foreach (var packageIndex in _PackageTypeIndex.Keys.OrderBy(i => i).ToList())
+                for (var offset = 0; offset < packageIndexes.Count; offset += PropertyIndexRebuildBatchSize)
                 {
-                    var parsedPackage = CreatePackageFromStoredMetadata(packageIndex);
-                    Indexes.IndexPackage(parsedPackage, packageIndex);
+                    var batch = packageIndexes.Skip(offset).Take(PropertyIndexRebuildBatchSize).ToList();
 
-                    progressEvent.Current++;
-                    if (progressEvent.Current % 100 == 0)
+                    // Parse packages before opening a transaction: FromStream() can call back
+                    // into this store's own IMetadataSource methods (e.g. GetFiles), which are
+                    // not transaction-aware and must not run while a write transaction is open.
+                    var parsedBatch = batch.Select(packageIndex => (packageIndex, package: CreatePackageFromStoredMetadata(packageIndex))).ToList();
+
+                    var parameterNames = string.Join(",", batch.Select((_, i) => $"$p{i}"));
+                    using var transaction = Connection.BeginTransaction();
+
+                    using (var clearCommand = Connection.CreateCommand())
                     {
-                        PackageIndexingProgress?.Invoke(this, progressEvent);
+                        clearCommand.Transaction = transaction;
+                        clearCommand.CommandText = $"DELETE FROM package_property_cache WHERE package_index IN ({parameterNames});";
+                        for (var i = 0; i < batch.Count; i++)
+                        {
+                            clearCommand.Parameters.AddWithValue($"$p{i}", batch[i]);
+                        }
+                        clearCommand.ExecuteNonQuery();
+
+                        clearCommand.Parameters.Clear();
+                        clearCommand.CommandText = $"DELETE FROM package_custom_key_index WHERE package_index IN ({parameterNames});";
+                        for (var i = 0; i < batch.Count; i++)
+                        {
+                            clearCommand.Parameters.AddWithValue($"$p{i}", batch[i]);
+                        }
+                        clearCommand.ExecuteNonQuery();
                     }
+
+                    foreach (var (packageIndex, parsedPackage) in parsedBatch)
+                    {
+                        WritePropertyIndexes(parsedPackage, packageIndex, transaction);
+                        progressEvent.Current++;
+                    }
+
+                    transaction.Commit();
+                    PackageIndexingProgress?.Invoke(this, progressEvent);
                 }
 
-                PackageIndexingProgress?.Invoke(this, progressEvent);
+                WriteProperty("property_index_built", "1");
                 _IsReindexingRequired = false;
-                IsIndexDirty = true;
                 CatalogGenerationDirty = true;
             }
             finally
@@ -4743,7 +4816,7 @@ ORDER BY package_index;";
                     throw new KeyNotFoundException();
                 }
 
-                return Indexes.TrySimpleKeyLookup(packageIndex, indexName, out value);
+                return TryReadPropertyCache(packageIndex, indexName, out value);
             }
             finally
             {
@@ -4768,7 +4841,23 @@ ORDER BY package_index;";
                     return value.Count > 0;
                 }
 
-                return Indexes.TryListKeyLookup(packageIndex, indexName, out value);
+                if (string.Equals(indexName, Microsoft.PackageGraph.MicrosoftUpdate.Index.AvailableIndexes.PrerequisitesIndexName, StringComparison.Ordinal) &&
+                    typeof(T) == typeof(IPrerequisite))
+                {
+                    if (!TryReadPropertyCache<List<List<Guid>>>(packageIndex, indexName, out var groups))
+                    {
+                        value = null;
+                        return false;
+                    }
+
+                    value = groups
+                        .Select(group => (IPrerequisite)(group.Count == 1 ? new Simple(group[0]) : new AtLeastOne(group)))
+                        .Cast<T>()
+                        .ToList();
+                    return true;
+                }
+
+                return TryReadPropertyCache(packageIndex, indexName, out value);
             }
             finally
             {
@@ -4781,13 +4870,22 @@ ORDER BY package_index;";
             StateLock.EnterReadLock();
             try
             {
-                if (Indexes.TryPackageLookupByCustomKey(key, indexName, out var packageIndex))
+                using var command = Connection.CreateCommand();
+                command.CommandText = @"
+SELECT package_index
+FROM package_custom_key_index
+WHERE index_name = $indexName AND key_text = $keyText
+LIMIT 1;";
+                command.Parameters.AddWithValue("$indexName", indexName);
+                command.Parameters.AddWithValue("$keyText", key.ToString());
+                var result = command.ExecuteScalar();
+                if (result == null || result == DBNull.Value)
                 {
-                    return TryGetPackageIdentity(packageIndex, out value);
+                    value = null;
+                    return false;
                 }
 
-                value = null;
-                return false;
+                return TryGetPackageIdentity(Convert.ToInt32((long)result), out value);
             }
             finally
             {
@@ -4800,17 +4898,33 @@ ORDER BY package_index;";
             StateLock.EnterReadLock();
             try
             {
-                if (Indexes.TryPackageListLookupByCustomKey(key, indexName, out List<int> packageIndexes))
+                var packageIndexes = new List<int>();
+                using (var command = Connection.CreateCommand())
                 {
-                    value = packageIndexes
-                        .Select(packageIndex => TryGetPackageIdentity(packageIndex, out var identity) ? identity : null)
-                        .Where(identity => identity != null)
-                        .ToList();
-                    return true;
+                    command.CommandText = @"
+SELECT package_index
+FROM package_custom_key_index
+WHERE index_name = $indexName AND key_text = $keyText;";
+                    command.Parameters.AddWithValue("$indexName", indexName);
+                    command.Parameters.AddWithValue("$keyText", key.ToString());
+                    using var reader = command.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        packageIndexes.Add(reader.GetInt32(0));
+                    }
                 }
 
-                value = null;
-                return false;
+                if (packageIndexes.Count == 0)
+                {
+                    value = null;
+                    return false;
+                }
+
+                value = packageIndexes
+                    .Select(packageIndex => TryGetPackageIdentity(packageIndex, out var identity) ? identity : null)
+                    .Where(identity => identity != null)
+                    .ToList();
+                return true;
             }
             finally
             {
@@ -4820,15 +4934,7 @@ ORDER BY package_index;";
 
         public List<IndexDefinition> GetAvailableIndexes()
         {
-            StateLock.EnterReadLock();
-            try
-            {
-                return Indexes.GetLoadedIndexes();
-            }
-            finally
-            {
-                StateLock.ExitReadLock();
-            }
+            return KnownPropertyIndexes;
         }
 
         IEnumerator<IPackage> IEnumerable<IPackage>.GetEnumerator()
@@ -4853,8 +4959,6 @@ ORDER BY package_index;";
 
                 Flush();
 
-                Indexes?.CloseInput();
-                IndexBackingStream?.Dispose();
                 Connection?.Dispose();
 
                 _PackageTypeIndex.Clear();
