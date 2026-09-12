@@ -38,7 +38,9 @@ namespace Microsoft.PackageGraph.Storage.Local
     {
         public const string DatabaseFileName = "metadata.sqlite";
 
-        private const int SchemaVersion = 11;
+        // internal, not private: SQLiteClientSyncMetadataStore validates against this
+        // same value so the two can never silently drift apart again.
+        internal const int SchemaVersion = 11;
         private const string CompressionNone = "none";
         private const string CompressionBrotli = "br";
         private const string CompressionGZip = "gzip";

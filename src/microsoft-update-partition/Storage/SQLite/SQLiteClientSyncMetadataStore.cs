@@ -30,7 +30,6 @@ namespace Microsoft.PackageGraph.Storage.Local
     /// </summary>
     internal sealed class SQLiteClientSyncMetadataStore : IClientSyncProjectionStore
     {
-        private const int RequiredSchemaVersion = 10;
         private const int MaxObservedValuesPerType = 20000;
         private const int MaxObservedIdentifierLength = 2048;
         private const int MetadataCacheCapacity = 128;
@@ -1606,11 +1605,11 @@ WHERE type = 'table'
 
             var schemaVersionText = ReadProperty(connection, "schema_version");
             if (!int.TryParse(schemaVersionText, out var schemaVersion)
-                || schemaVersion != RequiredSchemaVersion)
+                || schemaVersion != SQLitePackageStore.SchemaVersion)
             {
                 throw new InvalidDataException(
                     $"Unsupported SQLite metadata schema '{schemaVersionText ?? "missing"}'. " +
-                    $"Delete metadata.sqlite and run pre-fetch again with schema {RequiredSchemaVersion}.");
+                    $"Delete metadata.sqlite and run pre-fetch again with schema {SQLitePackageStore.SchemaVersion}.");
             }
 
             var requiredTables = new[]
@@ -1650,7 +1649,7 @@ WHERE type = 'table'
                             CultureInfo.InvariantCulture) != 1)
                     {
                         throw new InvalidDataException(
-                            $"SQLite metadata schema {RequiredSchemaVersion} is incomplete: " +
+                            $"SQLite metadata schema {SQLitePackageStore.SchemaVersion} is incomplete: " +
                             $"missing table '{tableName}'. Delete metadata.sqlite and run pre-fetch again.");
                     }
                 }
