@@ -34,7 +34,7 @@ namespace Microsoft.PackageGraph.Storage.Local
     /// delta archives named 0.zip, 1.zip, ... . Metadata, file metadata and the
     /// serialized index container now live in store/metadata.sqlite.
     /// </summary>
-    class SQLitePackageStore : IMetadataSink, IMetadataStore, IMetadataLookup, IMicrosoftUpdateFileLocationLookup, ISyncAnchorStore, ISyncCheckpointStore, IObservedInventoryStore, IDriverSyncStateStore, IReloadableMetadataStore, IMetadataCatalogPublicationControl, IObservedOperationsStore
+    class SQLitePackageStore : IMetadataSink, IMetadataStore, IMetadataLookup, IMicrosoftUpdateFileLocationLookup, ISyncAnchorStore, ISyncCheckpointStore, IObservedInventoryStore, IDriverSyncStateStore, IReloadableMetadataStore, IMetadataCatalogPublicationControl, IObservedOperationsStore, ISupersededUpdatePruneStore
     {
         public const string DatabaseFileName = "metadata.sqlite";
 
@@ -1609,6 +1609,298 @@ FROM active_detectoids AS active;";
             finally
             {
                 StateLock.ExitWriteLock();
+            }
+        }
+
+        public SupersededPruneStatus GetSupersededPruneStatus(int supersededForDays)
+        {
+            StateLock.EnterReadLock();
+            try
+            {
+                var candidates = ComputeSupersededPruneCandidates(supersededForDays, null);
+                var estimatedBytes = GetTotalMetadataBytes(candidates, null);
+                return new SupersededPruneStatus(supersededForDays, candidates.Count, estimatedBytes);
+            }
+            finally
+            {
+                StateLock.ExitReadLock();
+            }
+        }
+
+        public long PruneSupersededUpdates(int supersededForDays)
+        {
+            int prunedCount;
+            StateLock.EnterWriteLock();
+            try
+            {
+                using var transaction = Connection.BeginTransaction();
+                var candidates = ComputeSupersededPruneCandidates(supersededForDays, transaction);
+                prunedCount = candidates.Count;
+                if (candidates.Count == 0)
+                {
+                    transaction.Commit();
+                    return 0;
+                }
+
+                ReassignSharedFileOwnership(candidates, transaction);
+
+                var parameterNames = string.Join(",", candidates.Select((_, i) => $"$p{i}"));
+                using (var deleteCommand = Connection.CreateCommand())
+                {
+                    deleteCommand.Transaction = transaction;
+                    deleteCommand.CommandText = $"DELETE FROM packages WHERE package_index IN ({parameterNames});";
+                    for (var i = 0; i < candidates.Count; i++)
+                    {
+                        deleteCommand.Parameters.AddWithValue($"$p{i}", candidates[i]);
+                    }
+                    deleteCommand.ExecuteNonQuery();
+                }
+
+                transaction.Commit();
+
+                foreach (var packageIndex in candidates)
+                {
+                    _PackageTypeIndex.Remove(packageIndex);
+                }
+
+                CatalogGenerationDirty = true;
+            }
+            finally
+            {
+                StateLock.ExitWriteLock();
+            }
+
+            Flush();
+            return prunedCount;
+        }
+
+        // Computes packages eligible for supersedence pruning:
+        //   1. superseded by another package that is present and at least supersededForDays old;
+        //   2. does not itself supersede a still-present package that isn't also being pruned
+        //      (pruning it would silently un-mark that package as superseded); and
+        //   3. is not a bundle member of a bundle that is present and not also being pruned.
+        // Rules 2 and 3 are enforced to a fixed point since removing one candidate can strand another.
+        private List<int> ComputeSupersededPruneCandidates(int supersededForDays, SqliteTransaction transaction)
+        {
+            var cutoff = DateTimeOffset.UtcNow.AddDays(-supersededForDays);
+
+            var packageUpdateIds = new Dictionary<int, Guid>();
+            var packageRevisions = new Dictionary<int, int>();
+            var packageCreatedAt = new Dictionary<int, DateTimeOffset>();
+
+            using (var command = Connection.CreateCommand())
+            {
+                command.Transaction = transaction;
+                command.CommandText = "SELECT package_index, identity, created_at FROM packages;";
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    var packageIndex = reader.GetInt32(0);
+                    var parts = reader.GetString(1).Split(':');
+                    if (parts.Length == 3
+                        && Guid.TryParse(parts[1], out var updateId)
+                        && int.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out var revision)
+                        && DateTimeOffset.TryParse(
+                            reader.GetString(2),
+                            CultureInfo.InvariantCulture,
+                            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                            out var createdAt))
+                    {
+                        packageUpdateIds[packageIndex] = updateId;
+                        packageRevisions[packageIndex] = revision;
+                        packageCreatedAt[packageIndex] = createdAt;
+                    }
+                }
+            }
+
+            var updateIdToPackageIndices = new Dictionary<Guid, List<int>>();
+            foreach (var pair in packageUpdateIds)
+            {
+                if (!updateIdToPackageIndices.TryGetValue(pair.Value, out var list))
+                {
+                    list = new List<int>();
+                    updateIdToPackageIndices[pair.Value] = list;
+                }
+
+                list.Add(pair.Key);
+            }
+
+            var supersedesEdges = new List<(int SupersedingIndex, Guid SupersededUpdateId)>();
+            using (var command = Connection.CreateCommand())
+            {
+                command.Transaction = transaction;
+                command.CommandText = "SELECT superseding_package_index, superseded_update_id FROM client_sync_supersedence;";
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    if (Guid.TryParse(reader.GetString(1), out var supersededUpdateId))
+                    {
+                        supersedesEdges.Add((reader.GetInt32(0), supersededUpdateId));
+                    }
+                }
+            }
+
+            var bundleEdges = new List<(int BundleIndex, Guid BundledUpdateId, int BundledRevision)>();
+            using (var command = Connection.CreateCommand())
+            {
+                command.Transaction = transaction;
+                command.CommandText = "SELECT bundle_package_index, bundled_update_id, bundled_revision_number FROM client_sync_bundles;";
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    if (Guid.TryParse(reader.GetString(1), out var bundledUpdateId))
+                    {
+                        bundleEdges.Add((reader.GetInt32(0), bundledUpdateId, reader.GetInt32(2)));
+                    }
+                }
+            }
+
+            var supersededByEdge = new Dictionary<Guid, List<int>>();
+            foreach (var edge in supersedesEdges)
+            {
+                if (!supersededByEdge.TryGetValue(edge.SupersededUpdateId, out var list))
+                {
+                    list = new List<int>();
+                    supersededByEdge[edge.SupersededUpdateId] = list;
+                }
+
+                list.Add(edge.SupersedingIndex);
+            }
+
+            var candidates = new HashSet<int>();
+            foreach (var pair in supersededByEdge)
+            {
+                if (!updateIdToPackageIndices.TryGetValue(pair.Key, out var targetIndices))
+                {
+                    continue;
+                }
+
+                var hasAgedPresentReplacement = pair.Value.Any(supersedingIndex =>
+                    packageCreatedAt.TryGetValue(supersedingIndex, out var supersedingCreatedAt)
+                    && supersedingCreatedAt <= cutoff);
+
+                if (hasAgedPresentReplacement)
+                {
+                    foreach (var targetIndex in targetIndices)
+                    {
+                        candidates.Add(targetIndex);
+                    }
+                }
+            }
+
+            bool changed;
+            do
+            {
+                changed = false;
+
+                foreach (var edge in supersedesEdges)
+                {
+                    if (!candidates.Contains(edge.SupersedingIndex))
+                    {
+                        continue;
+                    }
+
+                    if (!updateIdToPackageIndices.TryGetValue(edge.SupersededUpdateId, out var targetIndices))
+                    {
+                        continue;
+                    }
+
+                    if (targetIndices.Any(targetIndex => !candidates.Contains(targetIndex)))
+                    {
+                        candidates.Remove(edge.SupersedingIndex);
+                        changed = true;
+                    }
+                }
+
+                foreach (var edge in bundleEdges)
+                {
+                    if (!updateIdToPackageIndices.TryGetValue(edge.BundledUpdateId, out var memberIndices))
+                    {
+                        continue;
+                    }
+
+                    var memberIndex = memberIndices.FirstOrDefault(
+                        idx => packageRevisions.TryGetValue(idx, out var revision) && revision == edge.BundledRevision,
+                        -1);
+                    if (memberIndex < 0 || !candidates.Contains(memberIndex))
+                    {
+                        continue;
+                    }
+
+                    var bundleIsPresent = packageUpdateIds.ContainsKey(edge.BundleIndex);
+                    if (bundleIsPresent && !candidates.Contains(edge.BundleIndex))
+                    {
+                        candidates.Remove(memberIndex);
+                        changed = true;
+                    }
+                }
+            } while (changed);
+
+            return candidates.OrderBy(index => index).ToList();
+        }
+
+        private long GetTotalMetadataBytes(List<int> packageIndices, SqliteTransaction transaction)
+        {
+            if (packageIndices.Count == 0)
+            {
+                return 0;
+            }
+
+            var parameterNames = string.Join(",", packageIndices.Select((_, i) => $"$p{i}"));
+            using var command = Connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = $"SELECT COALESCE(SUM(LENGTH(metadata)), 0) FROM packages WHERE package_index IN ({parameterNames});";
+            for (var i = 0; i < packageIndices.Count; i++)
+            {
+                command.Parameters.AddWithValue($"$p{i}", packageIndices[i]);
+            }
+
+            return (long)command.ExecuteScalar();
+        }
+
+        // file_locations rows are keyed by sha1_base64 but carry a single owning package_index
+        // (the package that first inserted them; ON CONFLICT does not update it). Deleting that
+        // owner cascades the row away, which would also cascade away package_file_map rows for
+        // any other, still-kept package sharing the same file. Reassign ownership to a surviving
+        // referencing package first so shared files are not silently lost.
+        private void ReassignSharedFileOwnership(List<int> prunedPackageIndices, SqliteTransaction transaction)
+        {
+            var parameterNames = string.Join(",", prunedPackageIndices.Select((_, i) => $"$p{i}"));
+            var reassignments = new Dictionary<string, int>();
+
+            using (var command = Connection.CreateCommand())
+            {
+                command.Transaction = transaction;
+                command.CommandText = $@"
+SELECT fl.sha1_base64, pfm.package_index
+FROM file_locations fl
+JOIN package_file_map pfm ON pfm.sha1_base64 = fl.sha1_base64
+WHERE fl.package_index IN ({parameterNames})
+  AND pfm.package_index NOT IN ({parameterNames});";
+                for (var i = 0; i < prunedPackageIndices.Count; i++)
+                {
+                    command.Parameters.AddWithValue($"$p{i}", prunedPackageIndices[i]);
+                }
+
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    var sha1Base64 = reader.GetString(0);
+                    if (!reassignments.ContainsKey(sha1Base64))
+                    {
+                        reassignments[sha1Base64] = reader.GetInt32(1);
+                    }
+                }
+            }
+
+            foreach (var pair in reassignments)
+            {
+                using var update = Connection.CreateCommand();
+                update.Transaction = transaction;
+                update.CommandText = "UPDATE file_locations SET package_index = $newOwner WHERE sha1_base64 = $sha1;";
+                update.Parameters.AddWithValue("$newOwner", pair.Value);
+                update.Parameters.AddWithValue("$sha1", pair.Key);
+                update.ExecuteNonQuery();
             }
         }
 
