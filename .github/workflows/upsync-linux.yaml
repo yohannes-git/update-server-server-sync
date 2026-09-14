@@ -39,7 +39,7 @@ jobs:
           zip -jr out/upsync-linux.zip out/upsync/Release/net9.0/linux-x64/publish/*
 
       - name: Upload build logs to release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: linux-${{ github.sha }}
           files: out/upsync-linux.zip

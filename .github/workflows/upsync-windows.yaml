@@ -32,7 +32,7 @@ jobs:
           powershell Compress-Archive -Path out/upsync/Release/net9.0/win-x64/publish/* -DestinationPath out/upsync-windows.zip
 
       - name: Upload artifact to GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: windows-${{ github.sha }}
           files: out/upsync-windows.zip
